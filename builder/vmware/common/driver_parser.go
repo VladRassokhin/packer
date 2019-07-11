@@ -1,117 +1,59 @@
 package common
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"math"
 	"net"
 	"os"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
-type sentinelSignaller chan struct{}
-
-/** low-level parsing */
-// strip the comments and extraneous newlines from a byte channel
-func uncomment(eof sentinelSignaller, in <-chan byte) (chan byte, sentinelSignaller) {
-	out := make(chan byte)
-	eoc := make(sentinelSignaller)
-
-	go func(in <-chan byte, out chan byte) {
-		var endofline bool
-		for stillReading := true; stillReading; {
-			select {
-			case <-eof:
-				stillReading = false
-			case ch := <-in:
-				switch ch {
-				case '#':
-					endofline = true
-				case '\n':
-					if endofline {
-						endofline = false
-					}
-				}
-				if !endofline {
-					out <- ch
-				}
-			}
-		}
-		close(eoc)
-	}(in, out)
-	return out, eoc
-}
+var tokenizeDhcpConfigRegex = regexp.MustCompile(`"[^"]*"|[{};]|[^\r\n\t {};"]+`)
 
 // convert a byte channel into a channel of pseudo-tokens
-func tokenizeDhcpConfig(eof sentinelSignaller, in chan byte) (chan string, sentinelSignaller) {
-	var ch byte
-	var state string
-	var quote bool
-
-	eot := make(sentinelSignaller)
+func tokenizeDhcpConfig(in chan string) chan string {
+	var line string
+	var leftover string
+	leftover = ""
 
 	out := make(chan string)
 	go func(out chan string) {
-		for stillReading := true; stillReading; {
-			select {
-			case <-eof:
-				stillReading = false
-
-			case ch = <-in:
-				if quote {
-					if ch == '"' {
-						out <- state + string(ch)
-						state, quote = "", false
-						continue
-					}
-					state += string(ch)
-					continue
-				}
-
-				switch ch {
-				case '"':
-					quote = true
-					state += string(ch)
-					continue
-
-				case '\r':
-					fallthrough
-				case '\n':
-					fallthrough
-				case '\t':
-					fallthrough
-				case ' ':
-					if len(state) == 0 {
-						continue
-					}
-					out <- state
-					state = ""
-
-				case '{':
-					fallthrough
-				case '}':
-					fallthrough
-				case ';':
-					if len(state) > 0 {
-						out <- state
-					}
-					out <- string(ch)
-					state = ""
-
-				default:
-					state += string(ch)
+		for line := range in {
+			if len(leftover) > 0 {
+				line = leftover + "\n" + line
+				leftover = ""
+			}
+			if strings.Count(line, `"`)%2 != 0 {
+				// Unfinished quotation must leave over
+				index := strings.LastIndexByte(line, '"')
+				leftover = line[index:]
+				line = line[0:index]
+			}
+			parts := tokenizeDhcpConfigRegex.FindAllString(line, -1)
+			for _, s := range parts {
+				if len(s) > 0 {
+					out <- s
 				}
 			}
 		}
-		if len(state) > 0 {
-			out <- state
+		if len(leftover) > 0 {
+			parts := tokenizeDhcpConfigRegex.FindAllString(line, -1)
+			for _, s := range parts {
+				if len(s) > 0 {
+					out <- s
+				}
+			}
 		}
-		close(eot)
+		close(out)
 	}(out)
-	return out, eot
+	return out
 }
 
 /** mid-level parsing */
@@ -176,7 +118,7 @@ leave:
 }
 
 // convert a channel of pseudo-tokens into an tkGroup tree */
-func parseDhcpConfig(eof sentinelSignaller, in chan string) (tkGroup, error) {
+func parseDhcpConfig(in chan string) (tkGroup, error) {
 	var tokens []string
 	var result tkGroup
 
@@ -190,121 +132,121 @@ func parseDhcpConfig(eof sentinelSignaller, in chan string) (tkGroup, error) {
 		}(out)
 		return parseTokenParameter(out)
 	}
-
-	for stillReading, currentgroup := true, &result; stillReading; {
-		select {
-		case <-eof:
-			stillReading = false
-
-		case tk := <-in:
-			switch tk {
-			case "{":
-				grp := &tkGroup{parent: currentgroup}
-				grp.id = toParameter(tokens)
-				currentgroup.groups = append(currentgroup.groups, grp)
-				currentgroup = grp
-			case "}":
-				if currentgroup.parent == nil {
-					return tkGroup{}, fmt.Errorf("Unable to close the global declaration")
-				}
-				if len(tokens) > 0 {
-					return tkGroup{}, fmt.Errorf("List of tokens was left unterminated : %v", tokens)
-				}
-				currentgroup = currentgroup.parent
-			case ";":
-				arg := toParameter(tokens)
-				currentgroup.params = append(currentgroup.params, arg)
-			default:
-				tokens = append(tokens, tk)
-				continue
+	currentgroup := &result
+	for tk := range in {
+		switch tk {
+		case "{":
+			grp := &tkGroup{parent: currentgroup}
+			grp.id = toParameter(tokens)
+			currentgroup.groups = append(currentgroup.groups, grp)
+			currentgroup = grp
+		case "}":
+			if currentgroup.parent == nil {
+				return tkGroup{}, fmt.Errorf("Unable to close the global declaration")
 			}
-			tokens = []string{}
+			if len(tokens) > 0 {
+				return tkGroup{}, fmt.Errorf("List of tokens was left unterminated : %v", tokens)
+			}
+			currentgroup = currentgroup.parent
+		case ";":
+			arg := toParameter(tokens)
+			currentgroup.params = append(currentgroup.params, arg)
+		default:
+			tokens = append(tokens, tk)
+			continue
 		}
+		tokens = []string{}
 	}
 	return result, nil
 }
 
-func tokenizeNetworkMapConfig(eof sentinelSignaller, in chan byte) (chan string, sentinelSignaller) {
-	var ch byte
-	var state string
-	var quote bool
-	var lastnewline bool
+var tokenizeNetworkMapConfigRegex = regexp.MustCompile(`"[^"]*"|\n+|[.=]|[^\r\t .="]+`)
 
-	eot := make(sentinelSignaller)
+func tokenizeNetworkMapConfig(in chan string) chan string {
+	var line string
+	var leftover string
+	leftover = ""
 
 	out := make(chan string)
 	go func(out chan string) {
-		for stillReading := true; stillReading; {
-			select {
-			case <-eof:
-				stillReading = false
-
-			case ch = <-in:
-				if quote {
-					if ch == '"' {
-						out <- state + string(ch)
-						state, quote = "", false
-						continue
+		for line := range in {
+			if len(leftover) > 0 {
+				line = leftover + line
+				leftover = ""
+			}
+			if strings.Count(line, `"`)%2 != 0 {
+				// Unfinished quotation must leave over
+				index := strings.LastIndexByte(line, '"')
+				leftover = line[index:]
+				line = line[0:index]
+			}
+			parts := tokenizeNetworkMapConfigRegex.FindAllString(line, -1)
+			for _, s := range parts {
+				if len(s) > 0 {
+					if s[0] == '\n' {
+						s = "\n"
 					}
-					state += string(ch)
-					continue
+					out <- s
 				}
-
-				switch ch {
-				case '"':
-					quote = true
-					state += string(ch)
-					continue
-
-				case '\r':
-					fallthrough
-				case '\t':
-					fallthrough
-				case ' ':
-					if len(state) == 0 {
-						continue
-					}
-					out <- state
-					state = ""
-
-				case '\n':
-					if lastnewline {
-						continue
-					}
-					if len(state) > 0 {
-						out <- state
-					}
-					out <- string(ch)
-					state = ""
-					lastnewline = true
-					continue
-
-				case '.':
-					fallthrough
-				case '=':
-					if len(state) > 0 {
-						out <- state
-					}
-					out <- string(ch)
-					state = ""
-
-				default:
-					state += string(ch)
-				}
-				lastnewline = false
 			}
 		}
-		if len(state) > 0 {
-			out <- state
+		if len(leftover) > 0 {
+			parts := tokenizeNetworkMapConfigRegex.FindAllString(line, -1)
+			for _, s := range parts {
+				if len(s) > 0 {
+					out <- s
+				}
+			}
 		}
-		close(eot)
+		close(out)
 	}(out)
-	return out, eot
+	return out
 }
 
-func parseNetworkMapConfig(eof sentinelSignaller, in chan string) (NetworkMap, error) {
-	var unsorted map[string]map[string]string
+// contains reports whether the string contains the byte c.
+func contains(s string, c byte) bool {
+	return strings.IndexByte(s, c) != -1
+}
+
+// simplified strconv.Unquote
+func unquote(s string) (string, error) {
+	n := len(s)
+	if n < 2 {
+		return "", strconv.ErrSyntax
+	}
+	quote := s[0]
+	if quote != '"' || quote != s[n-1] {
+		return "", strconv.ErrSyntax
+	}
+	s = s[1 : n-1]
+
+	// Is it trivial? Avoid allocation.
+	if !contains(s, '\\') && !contains(s, quote) && utf8.ValidString(s) {
+		return s, nil
+	}
+
+	var runeTmp [utf8.UTFMax]byte
+	buf := make([]byte, 0, 3*len(s)/2) // Try to avoid more allocations.
+	for len(s) > 0 {
+		c, multibyte, ss, err := strconv.UnquoteChar(s, quote)
+		if err != nil {
+			return "", err
+		}
+		s = ss
+		if c < utf8.RuneSelf || !multibyte {
+			buf = append(buf, byte(c))
+		} else {
+			n := utf8.EncodeRune(runeTmp[:], c)
+			buf = append(buf, runeTmp[:n]...)
+		}
+	}
+	return string(buf), nil
+}
+
+func parseNetworkMapConfig(in chan string) (NetworkMap, error) {
+	var unsorted = make(map[string]map[string]string)
 	var state []string
+	state = make([]string, 0)
 
 	addResult := func(network string, attribute string, value string) error {
 		_, ok := unsorted[network]
@@ -312,7 +254,7 @@ func parseNetworkMapConfig(eof sentinelSignaller, in chan string) (NetworkMap, e
 			unsorted[network] = make(map[string]string)
 		}
 
-		val, err := strconv.Unquote(value)
+		val, err := unquote(value)
 		if err != nil {
 			return err
 		}
@@ -321,45 +263,39 @@ func parseNetworkMapConfig(eof sentinelSignaller, in chan string) (NetworkMap, e
 		current[attribute] = val
 		return nil
 	}
-
-	stillReading := true
-	for unsorted = make(map[string]map[string]string); stillReading; {
-		select {
-		case <-eof:
-			if len(state) == 3 {
-				err := addResult(state[0], state[1], state[2])
-				if err != nil {
-					return nil, err
-				}
+	for tk := range in {
+		switch tk {
+		case ".":
+			if len(state) != 1 {
+				return nil, fmt.Errorf("Missing network index")
 			}
-			stillReading = false
-		case tk := <-in:
-			switch tk {
-			case ".":
-				if len(state) != 1 {
-					return nil, fmt.Errorf("Missing network index")
-				}
-			case "=":
-				if len(state) != 2 {
-					return nil, fmt.Errorf("Assignment to empty attribute")
-				}
-			case "\n":
-				if len(state) == 0 {
-					continue
-				}
-				if len(state) != 3 {
-					return nil, fmt.Errorf("Invalid attribute assignment : %v", state)
-				}
-				err := addResult(state[0], state[1], state[2])
-				if err != nil {
-					return nil, err
-				}
-				state = make([]string, 0)
-			default:
-				state = append(state, tk)
+		case "=":
+			if len(state) != 2 {
+				return nil, fmt.Errorf("Assignment to empty attribute")
 			}
+		case "\n":
+			if len(state) == 0 {
+				continue
+			}
+			if len(state) != 3 {
+				return nil, fmt.Errorf("Invalid attribute assignment : %v", state)
+			}
+			err := addResult(state[0], state[1], state[2])
+			if err != nil {
+				return nil, err
+			}
+			state = make([]string, 0)
+		default:
+			state = append(state, tk)
 		}
 	}
+	if len(state) == 3 {
+		err := addResult(state[0], state[1], state[2])
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	result := make([]map[string]string, 0)
 	var keys []string
 	for k := range unsorted {
@@ -958,24 +894,22 @@ func (e *configDeclaration) Hardware() (net.HardwareAddr, error) {
 			result = append(result, addr.(pParameterHardware))
 		}
 	}
-	if len(result) > 0 {
+	if len(result) == 0 {
+		return nil, fmt.Errorf("No hardware address returned")
+	}
+	if len(result) > 1 {
 		return nil, fmt.Errorf("More than one hardware address returned : %v", result)
 	}
-	res := make(net.HardwareAddr, 0)
-	for _, by := range result[0].address {
-		res = append(res, by)
-	}
-	return res, nil
+	return result[0].address, nil
 }
 
 /*** Dhcp Configuration */
 type DhcpConfiguration []configDeclaration
 
 func ReadDhcpConfiguration(fd *os.File) (DhcpConfiguration, error) {
-	fromfile, eof := consumeFile(fd)
-	uncommented, eoc := uncomment(eof, fromfile)
-	tokenized, eot := tokenizeDhcpConfig(eoc, uncommented)
-	parsetree, err := parseDhcpConfig(eot, tokenized)
+	uncommented := toLineChannelWithoutComments(bufio.NewScanner(fd))
+	tokenized := tokenizeDhcpConfig(uncommented)
+	parsetree, err := parseDhcpConfig(tokenized)
 	if err != nil {
 		return nil, err
 	}
@@ -1069,12 +1003,10 @@ type NetworkNameMapper interface {
 }
 
 func ReadNetworkMap(fd *os.File) (NetworkMap, error) {
+	uncommented := toLineChannelWithoutComments(bufio.NewScanner(fd))
+	tokenized := tokenizeNetworkMapConfig(uncommented)
 
-	fromfile, eof := consumeFile(fd)
-	uncommented, eoc := uncomment(eof, fromfile)
-	tokenized, eot := tokenizeNetworkMapConfig(eoc, uncommented)
-
-	result, err := parseNetworkMapConfig(eot, tokenized)
+	result, err := parseNetworkMapConfig(tokenized)
 	if err != nil {
 		return nil, err
 	}
@@ -1110,89 +1042,43 @@ func (e *NetworkMap) repr() string {
 	return strings.Join(result, "\n")
 }
 
-/*** parser for VMware Fusion's networking file */
-func tokenizeNetworkingConfig(eof sentinelSignaller, in chan byte) (chan string, sentinelSignaller) {
-	var ch byte
-	var state string
-	var repeat_newline bool
+var wordSeparators = regexp.MustCompile("[\r\t ]+")
 
-	eot := make(sentinelSignaller)
-
-	out := make(chan string)
-	go func(out chan string) {
-		for reading := true; reading; {
-			select {
-			case <-eof:
-				reading = false
-
-			case ch = <-in:
-				switch ch {
-				case '\r':
-					fallthrough
-				case '\t':
-					fallthrough
-				case ' ':
-					if len(state) == 0 {
-						continue
-					}
-					out <- state
-					state = ""
-				case '\n':
-					if repeat_newline {
-						continue
-					}
-					if len(state) > 0 {
-						out <- state
-					}
-					out <- string(ch)
-					state = ""
-					repeat_newline = true
-					continue
-				default:
-					state += string(ch)
-				}
-				repeat_newline = false
-			}
-		}
-		if len(state) > 0 {
-			out <- state
-		}
-		close(eot)
-	}(out)
-	return out, eot
-}
-
-func splitNetworkingConfig(eof sentinelSignaller, in chan string) (chan []string, sentinelSignaller) {
+func toRowsChannel(scanner *bufio.Scanner) chan []string {
 	var out chan []string
-
-	eos := make(sentinelSignaller)
 
 	out = make(chan []string)
 	go func(out chan []string) {
-		row := make([]string, 0)
-		for reading := true; reading; {
-			select {
-			case <-eof:
-				reading = false
-
-			case tk := <-in:
-				switch tk {
-				case "\n":
-					if len(row) > 0 {
-						out <- row
-					}
-					row = make([]string, 0)
-				default:
-					row = append(row, tk)
-				}
+		for scanner.Scan() {
+			line := scanner.Text()
+			row := wordSeparators.Split(line, -1)
+			if len(row) > 0 {
+				out <- row
 			}
 		}
-		if len(row) > 0 {
-			out <- row
-		}
-		close(eos)
+		close(out)
 	}(out)
-	return out, eos
+	return out
+}
+
+func toLineChannelWithoutComments(scanner *bufio.Scanner) chan string {
+	var out chan string
+
+	out = make(chan string)
+	go func(out chan string) {
+		for scanner.Scan() {
+			line := scanner.Text()
+			i := strings.IndexByte(line, '#')
+			if i > -1 {
+				line = line[0:i]
+			}
+			if len(line) > 0 {
+				out <- line + "\n"
+			}
+		}
+		close(out)
+	}(out)
+	return out
 }
 
 /// All token types in networking file.
@@ -1659,37 +1545,30 @@ func NetworkingParserByCommand(command string) *func([]string) (*networkingComma
 	return nil
 }
 
-func parseNetworkingConfig(eof sentinelSignaller, rows chan []string) (chan networkingCommandEntry, sentinelSignaller) {
+func parseNetworkingConfig(rows chan []string) chan networkingCommandEntry {
 	var out chan networkingCommandEntry
-
-	eop := make(sentinelSignaller)
 
 	out = make(chan networkingCommandEntry)
 	go func(in chan []string, out chan networkingCommandEntry) {
-		for reading := true; reading; {
-			select {
-			case <-eof:
-				reading = false
-			case row := <-in:
-				if len(row) >= 1 {
-					parser := NetworkingParserByCommand(row[0])
-					if parser == nil {
-						log.Printf("Invalid command : %v", row)
-						continue
-					}
-					callback := *parser
-					entry, err := callback(row[1:])
-					if err != nil {
-						log.Printf("Unable to parse command : %v %v", err, row)
-						continue
-					}
-					out <- *entry
+		for row := range in {
+			if len(row) >= 1 {
+				parser := NetworkingParserByCommand(row[0])
+				if parser == nil {
+					log.Printf("Invalid command : %v", row)
+					continue
 				}
+				callback := *parser
+				entry, err := callback(row[1:])
+				if err != nil {
+					log.Printf("Unable to parse command : %v %v", err, row)
+					continue
+				}
+				out <- *entry
 			}
 		}
-		close(eop)
+		close(out)
 	}(rows, out)
-	return out, eop
+	return out
 }
 
 type NetworkingConfig struct {
@@ -1705,7 +1584,7 @@ func (c NetworkingConfig) repr() string {
 	return fmt.Sprintf("answer -> %v\nnat_portfwd -> %v\ndhcp_mac_to_ip -> %v\nbridge_mapping -> %v\nnat_prefix -> %v", c.answer, c.nat_portfwd, c.dhcp_mac_to_ip, c.bridge_mapping, c.nat_prefix)
 }
 
-func flattenNetworkingConfig(eof sentinelSignaller, in chan networkingCommandEntry) NetworkingConfig {
+func flattenNetworkingConfig(in chan networkingCommandEntry) NetworkingConfig {
 	var result NetworkingConfig
 	var vmnet int
 
@@ -1715,96 +1594,91 @@ func flattenNetworkingConfig(eof sentinelSignaller, in chan networkingCommandEnt
 	result.bridge_mapping = make(map[string]int)
 	result.nat_prefix = make(map[int][]int)
 
-	for reading := true; reading; {
-		select {
-		case <-eof:
-			reading = false
-		case e := <-in:
-			switch e.entry.(type) {
-			case networkingCommandEntry_answer:
-				vnet := e.answer.vnet
-				answers, exists := result.answer[vnet.Number()]
-				if !exists {
-					answers = make(map[string]string)
-					result.answer[vnet.Number()] = answers
-				}
-				answers[vnet.Option()] = e.answer.value
-			case networkingCommandEntry_remove_answer:
-				vnet := e.remove_answer.vnet
-				answers, exists := result.answer[vnet.Number()]
-				if exists {
-					delete(answers, vnet.Option())
-				} else {
-					log.Printf("Unable to remove answer %s as specified by `remove_answer`.\n", vnet.Repr())
-				}
-			case networkingCommandEntry_add_nat_portfwd:
-				vmnet = e.add_nat_portfwd.vnet
-				protoport := fmt.Sprintf("%s/%d", e.add_nat_portfwd.protocol, e.add_nat_portfwd.port)
-				target := fmt.Sprintf("%s:%d", e.add_nat_portfwd.target_host, e.add_nat_portfwd.target_port)
-				portfwds, exists := result.nat_portfwd[vmnet]
-				if !exists {
-					portfwds = make(map[string]string)
-					result.nat_portfwd[vmnet] = portfwds
-				}
-				portfwds[protoport] = target
-			case networkingCommandEntry_remove_nat_portfwd:
-				vmnet = e.remove_nat_portfwd.vnet
-				protoport := fmt.Sprintf("%s/%d", e.remove_nat_portfwd.protocol, e.remove_nat_portfwd.port)
-				portfwds, exists := result.nat_portfwd[vmnet]
-				if exists {
-					delete(portfwds, protoport)
-				} else {
-					log.Printf("Unable to remove nat port-forward %s from interface %s%d as requested by `remove_nat_portfwd`.\n", protoport, NetworkingInterfacePrefix, vmnet)
-				}
-			case networkingCommandEntry_add_dhcp_mac_to_ip:
-				vmnet = e.add_dhcp_mac_to_ip.vnet
-				dhcpmacs, exists := result.dhcp_mac_to_ip[vmnet]
-				if !exists {
-					dhcpmacs = make(map[string]net.IP)
-					result.dhcp_mac_to_ip[vmnet] = dhcpmacs
-				}
-				dhcpmacs[e.add_dhcp_mac_to_ip.mac.String()] = e.add_dhcp_mac_to_ip.ip
-			case networkingCommandEntry_remove_dhcp_mac_to_ip:
-				vmnet = e.remove_dhcp_mac_to_ip.vnet
-				dhcpmacs, exists := result.dhcp_mac_to_ip[vmnet]
-				if exists {
-					delete(dhcpmacs, e.remove_dhcp_mac_to_ip.mac.String())
-				} else {
-					log.Printf("Unable to remove dhcp_mac_to_ip entry %v from interface %s%d as specified by `remove_dhcp_mac_to_ip`.\n", e.remove_dhcp_mac_to_ip, NetworkingInterfacePrefix, vmnet)
-				}
-			case networkingCommandEntry_add_bridge_mapping:
-				intf := e.add_bridge_mapping.intf
-				if _, err := intf.Interface(); err != nil {
-					log.Printf("Interface \"%s\" as specified by `add_bridge_mapping` was not found on the current platform. This is a non-critical error. Ignoring.", intf.name)
-				}
-				result.bridge_mapping[intf.name] = e.add_bridge_mapping.vnet
-			case networkingCommandEntry_remove_bridge_mapping:
-				intf := e.remove_bridge_mapping.intf
-				if _, err := intf.Interface(); err != nil {
-					log.Printf("Interface \"%s\" as specified by `remove_bridge_mapping` was not found on the current platform. This is a non-critical error. Ignoring.", intf.name)
-				}
-				delete(result.bridge_mapping, intf.name)
-			case networkingCommandEntry_add_nat_prefix:
-				vmnet = e.add_nat_prefix.vnet
-				_, exists := result.nat_prefix[vmnet]
-				if exists {
-					result.nat_prefix[vmnet] = append(result.nat_prefix[vmnet], e.add_nat_prefix.prefix)
-				} else {
-					result.nat_prefix[vmnet] = []int{e.add_nat_prefix.prefix}
-				}
-			case networkingCommandEntry_remove_nat_prefix:
-				vmnet = e.remove_nat_prefix.vnet
-				prefixes, exists := result.nat_prefix[vmnet]
-				if exists {
-					for index := 0; index < len(prefixes); index++ {
-						if prefixes[index] == e.remove_nat_prefix.prefix {
-							result.nat_prefix[vmnet] = append(prefixes[:index], prefixes[index+1:]...)
-							break
-						}
+	for e := range in {
+		switch e.entry.(type) {
+		case networkingCommandEntry_answer:
+			vnet := e.answer.vnet
+			answers, exists := result.answer[vnet.Number()]
+			if !exists {
+				answers = make(map[string]string)
+				result.answer[vnet.Number()] = answers
+			}
+			answers[vnet.Option()] = e.answer.value
+		case networkingCommandEntry_remove_answer:
+			vnet := e.remove_answer.vnet
+			answers, exists := result.answer[vnet.Number()]
+			if exists {
+				delete(answers, vnet.Option())
+			} else {
+				log.Printf("Unable to remove answer %s as specified by `remove_answer`.\n", vnet.Repr())
+			}
+		case networkingCommandEntry_add_nat_portfwd:
+			vmnet = e.add_nat_portfwd.vnet
+			protoport := fmt.Sprintf("%s/%d", e.add_nat_portfwd.protocol, e.add_nat_portfwd.port)
+			target := fmt.Sprintf("%s:%d", e.add_nat_portfwd.target_host, e.add_nat_portfwd.target_port)
+			portfwds, exists := result.nat_portfwd[vmnet]
+			if !exists {
+				portfwds = make(map[string]string)
+				result.nat_portfwd[vmnet] = portfwds
+			}
+			portfwds[protoport] = target
+		case networkingCommandEntry_remove_nat_portfwd:
+			vmnet = e.remove_nat_portfwd.vnet
+			protoport := fmt.Sprintf("%s/%d", e.remove_nat_portfwd.protocol, e.remove_nat_portfwd.port)
+			portfwds, exists := result.nat_portfwd[vmnet]
+			if exists {
+				delete(portfwds, protoport)
+			} else {
+				log.Printf("Unable to remove nat port-forward %s from interface %s%d as requested by `remove_nat_portfwd`.\n", protoport, NetworkingInterfacePrefix, vmnet)
+			}
+		case networkingCommandEntry_add_dhcp_mac_to_ip:
+			vmnet = e.add_dhcp_mac_to_ip.vnet
+			dhcpmacs, exists := result.dhcp_mac_to_ip[vmnet]
+			if !exists {
+				dhcpmacs = make(map[string]net.IP)
+				result.dhcp_mac_to_ip[vmnet] = dhcpmacs
+			}
+			dhcpmacs[e.add_dhcp_mac_to_ip.mac.String()] = e.add_dhcp_mac_to_ip.ip
+		case networkingCommandEntry_remove_dhcp_mac_to_ip:
+			vmnet = e.remove_dhcp_mac_to_ip.vnet
+			dhcpmacs, exists := result.dhcp_mac_to_ip[vmnet]
+			if exists {
+				delete(dhcpmacs, e.remove_dhcp_mac_to_ip.mac.String())
+			} else {
+				log.Printf("Unable to remove dhcp_mac_to_ip entry %v from interface %s%d as specified by `remove_dhcp_mac_to_ip`.\n", e.remove_dhcp_mac_to_ip, NetworkingInterfacePrefix, vmnet)
+			}
+		case networkingCommandEntry_add_bridge_mapping:
+			intf := e.add_bridge_mapping.intf
+			if _, err := intf.Interface(); err != nil {
+				log.Printf("Interface \"%s\" as specified by `add_bridge_mapping` was not found on the current platform. This is a non-critical error. Ignoring.", intf.name)
+			}
+			result.bridge_mapping[intf.name] = e.add_bridge_mapping.vnet
+		case networkingCommandEntry_remove_bridge_mapping:
+			intf := e.remove_bridge_mapping.intf
+			if _, err := intf.Interface(); err != nil {
+				log.Printf("Interface \"%s\" as specified by `remove_bridge_mapping` was not found on the current platform. This is a non-critical error. Ignoring.", intf.name)
+			}
+			delete(result.bridge_mapping, intf.name)
+		case networkingCommandEntry_add_nat_prefix:
+			vmnet = e.add_nat_prefix.vnet
+			_, exists := result.nat_prefix[vmnet]
+			if exists {
+				result.nat_prefix[vmnet] = append(result.nat_prefix[vmnet], e.add_nat_prefix.prefix)
+			} else {
+				result.nat_prefix[vmnet] = []int{e.add_nat_prefix.prefix}
+			}
+		case networkingCommandEntry_remove_nat_prefix:
+			vmnet = e.remove_nat_prefix.vnet
+			prefixes, exists := result.nat_prefix[vmnet]
+			if exists {
+				for index := 0; index < len(prefixes); index++ {
+					if prefixes[index] == e.remove_nat_prefix.prefix {
+						result.nat_prefix[vmnet] = append(prefixes[:index], prefixes[index+1:]...)
+						break
 					}
-				} else {
-					log.Printf("Unable to remove nat prefix /%d from interface %s%d as specified by `remove_nat_prefix`.\n", e.remove_nat_prefix.prefix, NetworkingInterfacePrefix, vmnet)
 				}
+			} else {
+				log.Printf("Unable to remove nat prefix /%d from interface %s%d as specified by `remove_nat_prefix`.\n", e.remove_nat_prefix.prefix, NetworkingInterfacePrefix, vmnet)
 			}
 		}
 	}
@@ -1813,11 +1687,11 @@ func flattenNetworkingConfig(eof sentinelSignaller, in chan networkingCommandEnt
 
 // Constructor for networking file
 func ReadNetworkingConfig(fd *os.File) (NetworkingConfig, error) {
+	scanner := bufio.NewScanner(fd)
+
 	// start piecing together different parts of the file
-	fromfile, eof := consumeFile(fd)
-	tokenized, eot := tokenizeNetworkingConfig(eof, fromfile)
-	rows, eos := splitNetworkingConfig(eot, tokenized)
-	entries, eop := parseNetworkingConfig(eos, rows)
+	rows := toRowsChannel(scanner)
+	entries := parseNetworkingConfig(rows)
 
 	// parse the version
 	parsed_version, err := networkingReadVersion(<-rows)
@@ -1832,7 +1706,7 @@ func ReadNetworkingConfig(fd *os.File) (NetworkingConfig, error) {
 	}
 
 	// convert to a configuration
-	result := flattenNetworkingConfig(eop, entries)
+	result := flattenNetworkingConfig(entries)
 	return result, nil
 }
 
@@ -1914,18 +1788,21 @@ func (e NetworkingConfig) NameIntoDevices(name string) ([]string, error) {
 
 	var vmnets []string
 	var networkingType NetworkingType
-	if name == "hostonly" && len(netmapper[NetworkingType_HOSTONLY]) > 0 {
+	switch name {
+	case "hostonly":
 		networkingType = NetworkingType_HOSTONLY
-	} else if name == "nat" && len(netmapper[NetworkingType_NAT]) > 0 {
+	case "nat":
 		networkingType = NetworkingType_NAT
-	} else if name == "bridged" && len(netmapper[NetworkingType_BRIDGED]) > 0 {
+	case "bridged":
 		networkingType = NetworkingType_BRIDGED
-	} else {
-		return make([]string, 0), fmt.Errorf("Network name not found: %v", name)
+	default:
+		return make([]string, 0), fmt.Errorf("Network name not supported: %v", name)
 	}
-
-	for i := 0; i < len(netmapper[networkingType]); i++ {
-		vmnets = append(vmnets, fmt.Sprintf("%s%d", NetworkingInterfacePrefix, netmapper[networkingType][i]))
+	if len(netmapper[networkingType]) == 0 {
+		return make([]string, 0), fmt.Errorf("No networks of given type found: %v", name)
+	}
+	for _, value := range netmapper[networkingType] {
+		vmnets = append(vmnets, fmt.Sprintf("%s%d", NetworkingInterfacePrefix, value))
 	}
 	return vmnets, nil
 }
@@ -1951,24 +1828,4 @@ func (e NetworkingConfig) DeviceIntoName(device string) (string, error) {
 		return "bridged", nil
 	}
 	return "", fmt.Errorf("Unable to determine network type for device %s%d.", NetworkingInterfacePrefix, vmnet)
-}
-
-/** generic async file reader */
-func consumeFile(fd *os.File) (chan byte, sentinelSignaller) {
-	fromfile := make(chan byte)
-	eof := make(sentinelSignaller)
-	go func() {
-		b := make([]byte, 1)
-		for {
-			_, err := fd.Read(b)
-			if err != nil {
-				// In case of any error we must stop
-				// ErrClosed may appear since file is closed and this goroutine still left running
-				break
-			}
-			fromfile <- b[0]
-		}
-		close(eof)
-	}()
-	return fromfile, eof
 }
