@@ -96,18 +96,13 @@ func (e *tkGroup) String() string {
 // convert a channel of pseudo-tokens into an tkParameter struct
 func parseTokenParameter(in chan string) tkParameter {
 	var result tkParameter
-	for {
-		token := <-in
+	for token := range in {
 		if result.name == "" {
 			result.name = token
 			continue
 		}
 		switch token {
-		case "{":
-			fallthrough
-		case "}":
-			fallthrough
-		case ";":
+		case "{", "}", ";":
 			goto leave
 		default:
 			result.operand = append(result.operand, token)
@@ -128,7 +123,7 @@ func parseDhcpConfig(in chan string) (tkGroup, error) {
 			for _, v := range tokens {
 				out <- v
 			}
-			out <- ";"
+			close(out)
 		}(out)
 		return parseTokenParameter(out)
 	}
@@ -504,11 +499,7 @@ func parseParameter(val tkParameter) (pParameter, error) {
 		name, value := val.operand[0], val.operand[1]
 		return pParameterOption{name: name, value: value}, nil
 
-	case "allow":
-		fallthrough
-	case "deny":
-		fallthrough
-	case "ignore":
+	case "allow", "deny", "ignore":
 		if len(val.operand) < 1 {
 			return nil, fmt.Errorf("Invalid number of parameters for pParameterGrant : %v", val.operand)
 		}
